@@ -20,6 +20,8 @@
 
 #include <LovyanGFX.hpp>
 
+#include "secrets.h"
+
 // LovyanGFX LCD設定クラス
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ILI9341 _panel_instance;
@@ -72,8 +74,6 @@ public:
 Preferences preferences;
 
 // デフォルト設定
-#define DEFAULT_SSID "SSID"
-#define DEFAULT_PASSWORD "PASSSWORD"
 #define DEFAULT_RSS_URL "https://www.nhk.or.jp/rss/news/cat0.xml"
 
 // 設定保存用
@@ -143,8 +143,8 @@ LGFX_Sprite descSprite(&tft);
 // ================== 設定の読み込み・保存 ==================
 void loadSettings() {
   preferences.begin("rssreader", true);  // 読み取り専用
-  cfg_ssid = preferences.getString("ssid", DEFAULT_SSID);
-  cfg_password = preferences.getString("password", DEFAULT_PASSWORD);
+  cfg_ssid = preferences.getString("ssid", SSID);
+  cfg_password = preferences.getString("password", PASSWORD);
   cfg_rssUrl = preferences.getString("rssUrl", DEFAULT_RSS_URL);
   preferences.end();
   
