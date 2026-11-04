@@ -1,73 +1,25 @@
 /**
  * ESP32-C3 + 2.2インチLCD ライブカメラ表示
- * 
+ *
  * 使用LCD: ILI9341 2.2インチ (240x320 縦向き)
  * 使用ボード: Seeed XIAO ESP32C3
  * 使用ライブラリ: LovyanGFX, JPEGDEC
- * 
+ *
  * 機能:
  * - WiFi接続して国道ライブカメラ画像を表示
- * - 3秒毎に画像を切り替え
- * - 複数のカメラ地点をローテーション表示
+ * - 画面を上下に分割し、2地点を同時に表示 (各 240x160)
+ * - 10秒毎に次の2地点へ切り替え、全地点をローテーション表示
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <WiFiClient.h>
 
-#include <LovyanGFX.hpp>
 #include <JPEGDEC.h>
 
 #include "secrets.h"
-
-// LovyanGFX LCD設定クラス
-class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ILI9341 _panel_instance;
-  lgfx::Bus_SPI _bus_instance;
-
-public:
-  LGFX(void) {
-    {
-      auto cfg = _bus_instance.config();
-      cfg.spi_host = SPI2_HOST;
-      cfg.spi_mode = 0;
-      cfg.freq_write = 40000000;
-      cfg.freq_read  = 16000000;
-      cfg.spi_3wire  = false;
-      cfg.use_lock   = true;
-      cfg.dma_channel = SPI_DMA_CH_AUTO;
-      cfg.pin_sclk = 8;
-      cfg.pin_mosi = 10;
-      cfg.pin_miso = 9;
-      cfg.pin_dc   = 5;
-      _bus_instance.config(cfg);
-      _panel_instance.setBus(&_bus_instance);
-    }
-    {
-      auto cfg = _panel_instance.config();
-      cfg.pin_cs   = 7;
-      cfg.pin_rst  = 6;
-      cfg.pin_busy = -1;
-      cfg.memory_width  = 240;
-      cfg.memory_height = 320;
-      cfg.panel_width   = 240;
-      cfg.panel_height  = 320;
-      cfg.offset_x = 0;
-      cfg.offset_y = 0;
-      cfg.offset_rotation = 0;
-      cfg.dummy_read_pixel = 8;
-      cfg.dummy_read_bits  = 1;
-      cfg.readable = true;
-      cfg.invert   = false;
-      cfg.rgb_order = false;
-      cfg.dlen_16bit = false;
-      cfg.bus_shared = true;
-      _panel_instance.config(cfg);
-    }
-    setPanel(&_panel_instance);
-  }
-};
+#include "lgfx_config.h"
+#include "net_utils.h"
 
 // カメラ地点の定義
 struct CameraLocation {
@@ -99,9 +51,19 @@ const int NUM_CAMERAS = sizeof(cameras) / sizeof(cameras[0]);
 int currentCamera1 = 0;  // 上側のカメラ
 int currentCamera2 = 1;  // 下側のカメラ
 
+// 画面レイアウト
+const int SCREEN_WIDTH = 240;
+const int PANE_HEIGHT = 160;  // 上下それぞれの表示領域の高さ
+const int CAPTION_HEIGHT = 18;
+
 // 更新間隔 (10秒)
 const unsigned long UPDATE_INTERVAL = 10000;
 unsigned long lastUpdate = 0;
+
+// ダウンロード設定
+const size_t MAX_JPEG_SIZE = 100 * 1024;          // 1枚あたりの上限 (ヒープ枯渇防止)
+const unsigned long HTTP_TIMEOUT_MS = 10000;      // 接続・応答待ち
+const unsigned long DOWNLOAD_TIMEOUT_MS = 15000;  // 本文受信全体の締め切り
 
 // LCDオブジェクト
 LGFX tft;
@@ -115,13 +77,17 @@ size_t jpegBufferSize1 = 0;
 uint8_t* jpegBuffer2 = nullptr;
 size_t jpegBufferSize2 = 0;
 
-// 現在処理中の画像位置
-int currentDrawY = 0;
+// デコード結果を描画するときのオフセット (中央寄せ・上下の表示位置)
+int drawOffsetX = 0;
+int drawOffsetY = 0;
 
 // JPEG描画コールバック
-int jpegDrawCallback(JPEGDRAW *pDraw) {
-  // LCDに直接描画（Y座標をオフセット）
-  tft.pushImage(pDraw->x, pDraw->y + currentDrawY, pDraw->iWidth, pDraw->iHeight, (uint16_t*)pDraw->pPixels);
+int jpegDrawCallback(JPEGDRAW* pDraw) {
+  // RGB565_BIG_ENDIAN でデコードしている。LovyanGFX は setSwapBytes(false) (デフォルト) のとき
+  // uint16_t* を swap565 (ビッグエンディアン) として扱うので、そのまま渡せば正しい色になる。
+  // はみ出し分は displayImage() で設定したクリップ領域で切り取られる。
+  tft.pushImage(pDraw->x + drawOffsetX, pDraw->y + drawOffsetY,
+                pDraw->iWidth, pDraw->iHeight, (uint16_t*)pDraw->pPixels);
   return 1;
 }
 
@@ -134,17 +100,18 @@ void connectWiFi() {
   tft.println("WiFi接続中...");
   tft.print("SSID: ");
   tft.println(SSID);
-  
+
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(SSID, PASSWORD);
-  
+
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     tft.print(".");
     attempts++;
   }
-  
+
   if (WiFi.status() == WL_CONNECTED) {
     tft.println();
     tft.println("接続成功!");
@@ -157,141 +124,189 @@ void connectWiFi() {
   delay(1500);
 }
 
-// カメラ画像のURLを取得
-String getCameraImageUrl(const char* cameraUrl) {
-  return String(cameraUrl);
-}
-
 // 画像をダウンロード
-bool downloadImage(const String& url, uint8_t** buffer, size_t* bufferSize) {
+// Content-Length が無い (チャンク転送等) 場合も、MAX_JPEG_SIZE までは受信する
+bool downloadImage(const char* url, uint8_t** buffer, size_t* bufferSize) {
   // 既存のバッファをクリア
-  if (*buffer) {
-    free(*buffer);
-    *buffer = nullptr;
-    *bufferSize = 0;
+  free(*buffer);
+  *buffer = nullptr;
+  *bufferSize = 0;
+
+  if (!ensureWiFiConnected()) {
+    Serial.println("WiFi not connected");
+    return false;
   }
-  
-  WiFiClient client;
+
+  auto client = createClientFor(url);  // http / https に応じたクライアント
   HTTPClient http;
-  http.begin(client, url);
-  http.setTimeout(10000);
-  
-  int httpCode = http.GET();
-  
-  if (httpCode == HTTP_CODE_OK) {
-    *bufferSize = http.getSize();
-    if (*bufferSize > 0) {
-      *buffer = (uint8_t*)malloc(*bufferSize);
-      if (*buffer) {
-        WiFiClient* stream = http.getStreamPtr();
-        size_t bytesRead = 0;
-        
-        while (http.connected() && bytesRead < *bufferSize) {
-          size_t available = stream->available();
-          if (available) {
-            size_t toRead = min(available, *bufferSize - bytesRead);
-            size_t read = stream->readBytes(*buffer + bytesRead, toRead);
-            bytesRead += read;
-          }
-          delay(1);
-        }
-        
-        http.end();
-        Serial.printf("Downloaded %d bytes\n", bytesRead);
-        return (bytesRead == *bufferSize);
-      }
-    }
-  } else {
-    Serial.printf("HTTP error: %d\n", httpCode);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  if (!http.begin(*client, url)) {
+    Serial.printf("HTTP begin failed: %s\n", url);
+    return false;
   }
-  
+
+  const int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("HTTP error: %d (%s)\n", httpCode, url);
+    http.end();
+    return false;
+  }
+
+  const int contentLength = http.getSize();  // 不明な場合は -1
+  if (contentLength == 0 || contentLength > (int)MAX_JPEG_SIZE) {
+    Serial.printf("Invalid content length: %d\n", contentLength);
+    http.end();
+    return false;
+  }
+  const bool knownLength = contentLength > 0;
+  const size_t capacity = knownLength ? (size_t)contentLength : MAX_JPEG_SIZE;
+
+  uint8_t* data = (uint8_t*)malloc(capacity);
+  if (!data) {
+    Serial.printf("malloc failed: %u bytes (free heap: %u)\n", capacity, ESP.getFreeHeap());
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  size_t bytesRead = 0;
+  const unsigned long deadline = millis() + DOWNLOAD_TIMEOUT_MS;
+
+  // 全部読むか、切断されて残りデータも無くなるか、締め切りまで読む
+  while (bytesRead < capacity && (long)(deadline - millis()) > 0) {
+    const size_t available = stream->available();
+    if (available > 0) {
+      const size_t toRead = min(available, capacity - bytesRead);
+      bytesRead += stream->readBytes(data + bytesRead, toRead);
+    } else if (!http.connected()) {
+      break;
+    } else {
+      delay(1);
+    }
+  }
   http.end();
-  return false;
+
+  const bool complete = knownLength ? (bytesRead == capacity) : (bytesRead > 0 && bytesRead < capacity);
+  Serial.printf("Downloaded %u bytes%s\n", bytesRead, complete ? "" : " (incomplete)");
+
+  if (!complete) {
+    free(data);
+    return false;
+  }
+
+  if (!knownLength) {
+    // 余った領域を返す (失敗しても元のポインタは有効なのでそのまま使う)
+    uint8_t* shrunk = (uint8_t*)realloc(data, bytesRead);
+    if (shrunk) data = shrunk;
+  }
+
+  *buffer = data;
+  *bufferSize = bytesRead;
+  return true;
 }
 
-// JPEG画像をデコードして表示 (240x160にリサイズして上下2分割)
+// 縮小率を選ぶ: 表示領域 (targetW x targetH) を埋められる範囲で最も小さくする。
+// JPEGDEC は 1, 1/2, 1/4, 1/8 の縮小のみ対応 (拡大は不可)。
+int chooseDecodeScale(int width, int height, int targetW, int targetH, int* outW, int* outH) {
+  static const struct { int option; int divisor; } SCALES[] = {
+    {JPEG_SCALE_EIGHTH, 8},
+    {JPEG_SCALE_QUARTER, 4},
+    {JPEG_SCALE_HALF, 2},
+  };
+  for (const auto& s : SCALES) {
+    const int w = width / s.divisor;
+    const int h = height / s.divisor;
+    if (w >= targetW && h >= targetH) {
+      *outW = w;
+      *outH = h;
+      return s.option;
+    }
+  }
+  *outW = width;
+  *outH = height;
+  return 0;  // 等倍 (元画像が表示領域より小さい場合は余白が残る)
+}
+
+// JPEG画像をデコードして表示 (240x160 の領域に中央寄せ、はみ出しは切り取り)
 bool displayImage(uint8_t* buffer, size_t bufferSize, int yOffset, const char* cameraName) {
   if (!buffer || bufferSize == 0) {
     return false;
   }
-  
-  currentDrawY = yOffset;
-  int result = jpeg.openRAM(buffer, bufferSize, jpegDrawCallback);
-  
-  if (result) {
-    int originalWidth = jpeg.getWidth();
-    int originalHeight = jpeg.getHeight();
-    
-    Serial.printf("Camera: %s, Original: %dx%d\n", cameraName, originalWidth, originalHeight);
-    
-    // 画面の半分の高さ = 160px
-    // 横幅いっぱい = 240px
-    const int targetWidth = 240;
-    const int targetHeight = 160;
-    
-    // JPEGをデコードして表示（横幅いっぱいに拡大）
-    jpeg.setPixelType(RGB565_BIG_ENDIAN);
-    
-    // スケールを計算（JPEG_SCALE_HALF = 1/2, QUARTER = 1/4, EIGHTH = 1/8）
-    float scaleX = (float)targetWidth / originalWidth;
-    float scaleY = (float)targetHeight / originalHeight;
-    
-    // より大きいスケールを選択して画面を埋める
-    float scale = max(scaleX, scaleY);
-    
-    int decodeOption = 0;  // フルサイズ
-    if (scale <= 0.5) {
-      decodeOption = JPEG_SCALE_HALF;
-    } else if (scale <= 0.25) {
-      decodeOption = JPEG_SCALE_QUARTER;
-    } else if (scale <= 0.125) {
-      decodeOption = JPEG_SCALE_EIGHTH;
-    }
-    
-    jpeg.decode(0, 0, decodeOption);
-    jpeg.close();
-    
-    // カメラ名を表示
-    int textY = yOffset + targetHeight - 18;
-    tft.fillRect(0, textY, 240, 18, tft.color565(0, 0, 80));
-    tft.setTextColor(TFT_WHITE, tft.color565(0, 0, 80));
-    tft.setFont(&fonts::efontJA_12);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString(cameraName, 120, textY + 9);
-    tft.setTextDatum(TL_DATUM);
-    
-    return true;
+
+  if (!jpeg.openRAM(buffer, bufferSize, jpegDrawCallback)) {
+    Serial.printf("JPEG open failed: %s (error %d)\n", cameraName, jpeg.getLastError());
+    return false;
   }
-  
-  return false;
+
+  const int originalWidth = jpeg.getWidth();
+  const int originalHeight = jpeg.getHeight();
+
+  int scaledW = 0;
+  int scaledH = 0;
+  const int decodeOption =
+      chooseDecodeScale(originalWidth, originalHeight, SCREEN_WIDTH, PANE_HEIGHT, &scaledW, &scaledH);
+
+  Serial.printf("Camera: %s, Original: %dx%d -> %dx%d\n",
+                cameraName, originalWidth, originalHeight, scaledW, scaledH);
+
+  // 中央寄せ (大きい場合は左右/上下を均等に切り取る)
+  drawOffsetX = (SCREEN_WIDTH - scaledW) / 2;
+  drawOffsetY = yOffset + (PANE_HEIGHT - scaledH) / 2;
+
+  jpeg.setPixelType(RGB565_BIG_ENDIAN);
+
+  // 自分の表示領域の外 (もう一方の画像の領域) に描かないようにクリップ
+  tft.setClipRect(0, yOffset, SCREEN_WIDTH, PANE_HEIGHT);
+  const int decoded = jpeg.decode(0, 0, decodeOption);
+  tft.clearClipRect();
+  jpeg.close();
+
+  if (!decoded) {
+    Serial.printf("JPEG decode failed: %s (error %d)\n", cameraName, jpeg.getLastError());
+    return false;
+  }
+
+  // カメラ名を表示
+  const int textY = yOffset + PANE_HEIGHT - CAPTION_HEIGHT;
+  const uint16_t captionBg = tft.color565(0, 0, 80);
+  tft.fillRect(0, textY, SCREEN_WIDTH, CAPTION_HEIGHT, captionBg);
+  tft.setTextColor(TFT_WHITE, captionBg);
+  tft.setFont(&fonts::efontJA_12);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(cameraName, SCREEN_WIDTH / 2, textY + CAPTION_HEIGHT / 2);
+  tft.setTextDatum(TL_DATUM);
+
+  return true;
+}
+
+void drawPaneError(const char* message, int yOffset) {
+  tft.setFont(&fonts::efontJA_12);
+  tft.setTextColor(TFT_RED, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(message, SCREEN_WIDTH / 2, yOffset + PANE_HEIGHT / 2);
+  tft.setTextDatum(TL_DATUM);
 }
 
 // 2つの画像を同時に表示
 void displayBothImages() {
   tft.fillScreen(TFT_BLACK);
-  
+
   // 上側の画像を表示
   if (displayImage(jpegBuffer1, jpegBufferSize1, 0, cameras[currentCamera1].name)) {
     Serial.printf("Displayed camera 1: %s\n", cameras[currentCamera1].name);
   } else {
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("取得失敗(上)", 120, 80);
-    tft.setTextDatum(TL_DATUM);
+    drawPaneError("取得失敗(上)", 0);
   }
-  
-  // 区切り線
-  tft.drawFastHLine(0, 160, 240, TFT_YELLOW);
-  
+
   // 下側の画像を表示
-  if (displayImage(jpegBuffer2, jpegBufferSize2, 160, cameras[currentCamera2].name)) {
+  if (displayImage(jpegBuffer2, jpegBufferSize2, PANE_HEIGHT, cameras[currentCamera2].name)) {
     Serial.printf("Displayed camera 2: %s\n", cameras[currentCamera2].name);
   } else {
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("取得失敗(下)", 120, 240);
-    tft.setTextDatum(TL_DATUM);
+    drawPaneError("取得失敗(下)", PANE_HEIGHT);
   }
+
+  // 区切り線 (画像の後に描いて上書きされないようにする)
+  tft.drawFastHLine(0, PANE_HEIGHT, SCREEN_WIDTH, TFT_YELLOW);
 }
 
 // 次のカメラへ
@@ -300,15 +315,48 @@ void nextCameras() {
   currentCamera2 = (currentCamera2 + 2) % NUM_CAMERAS;
 }
 
+void showLoading(bool showNames) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setFont(&fonts::efontJA_12);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("画像取得中...", SCREEN_WIDTH / 2, 80);
+  if (showNames) {
+    tft.drawString(cameras[currentCamera1].name, SCREEN_WIDTH / 2, 100);
+    tft.drawString(cameras[currentCamera2].name, SCREEN_WIDTH / 2, 220);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+
+// 現在の2地点を取得して表示
+void updateCameras() {
+  Serial.printf("Fetching: %s and %s\n", cameras[currentCamera1].name, cameras[currentCamera2].name);
+
+  const bool success1 = downloadImage(cameras[currentCamera1].url, &jpegBuffer1, &jpegBufferSize1);
+  const bool success2 = downloadImage(cameras[currentCamera2].url, &jpegBuffer2, &jpegBufferSize2);
+
+  if (success1 || success2) {
+    displayBothImages();
+  } else {
+    // エラー表示
+    tft.fillScreen(TFT_RED);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.setTextDatum(MC_DATUM);
+    tft.setFont(&fonts::efontJA_16);
+    tft.drawString("取得失敗", SCREEN_WIDTH / 2, 160);
+    tft.setTextDatum(TL_DATUM);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n\n=== Live Camera Display ===");
-  
+
   tft.init();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
-  
+
   // スプラッシュ画面
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
@@ -325,9 +373,9 @@ void setup() {
   tft.drawString("ESP32-C3 + LovyanGFX", 120, 220);
   tft.setTextDatum(TL_DATUM);
   delay(2000);
-  
+
   connectWiFi();
-  
+
   if (WiFi.status() != WL_CONNECTED) {
     tft.fillScreen(TFT_RED);
     tft.setTextColor(TFT_WHITE, TFT_RED);
@@ -338,67 +386,22 @@ void setup() {
     delay(5000);
     ESP.restart();
   }
-  
+
   // 初回画像表示
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setFont(&fonts::efontJA_12);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString("画像取得中...", 120, 80);
-  tft.drawString(cameras[currentCamera1].name, 120, 100);
-  tft.setTextDatum(TL_DATUM);
-  
-  String url1 = getCameraImageUrl(cameras[currentCamera1].url);
-  bool success1 = downloadImage(url1, &jpegBuffer1, &jpegBufferSize1);
-  
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString(cameras[currentCamera2].name, 120, 220);
-  tft.setTextDatum(TL_DATUM);
-  
-  String url2 = getCameraImageUrl(cameras[currentCamera2].url);
-  bool success2 = downloadImage(url2, &jpegBuffer2, &jpegBufferSize2);
-  
-  if (success1 || success2) {
-    displayBothImages();
-  }
-  
+  showLoading(true);
+  updateCameras();
+
   lastUpdate = millis();
 }
 
 void loop() {
-  // 3秒毎に次のカメラ画像を表示
+  // UPDATE_INTERVAL (10秒) 毎に次のカメラ画像を表示
   if (millis() - lastUpdate >= UPDATE_INTERVAL) {
     nextCameras();
-    
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.setFont(&fonts::efontJA_12);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawString("画像取得中...", 120, 80);
-    tft.setTextDatum(TL_DATUM);
-    
-    String url1 = getCameraImageUrl(cameras[currentCamera1].url);
-    String url2 = getCameraImageUrl(cameras[currentCamera2].url);
-    
-    Serial.printf("Fetching: %s and %s\n", cameras[currentCamera1].name, cameras[currentCamera2].name);
-    
-    bool success1 = downloadImage(url1, &jpegBuffer1, &jpegBufferSize1);
-    bool success2 = downloadImage(url2, &jpegBuffer2, &jpegBufferSize2);
-    
-    if (success1 || success2) {
-      displayBothImages();
-    } else {
-      // エラー表示
-      tft.fillScreen(TFT_RED);
-      tft.setTextColor(TFT_WHITE, TFT_RED);
-      tft.setTextDatum(MC_DATUM);
-      tft.setFont(&fonts::efontJA_16);
-      tft.drawString("取得失敗", 120, 160);
-      tft.setTextDatum(TL_DATUM);
-    }
-    
+    showLoading(false);
+    updateCameras();
     lastUpdate = millis();
   }
-  
+
   delay(100);
 }
