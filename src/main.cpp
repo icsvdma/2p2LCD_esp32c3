@@ -26,6 +26,7 @@
 #include "lgfx_config.h"
 #include "net_utils.h"
 #include "text_utils.h"
+#include "long_press_button.h"
 
 // ================== 設定関連 ==================
 Preferences preferences;
@@ -117,34 +118,7 @@ bool descSpriteReady = false;
 std::vector<TextLine> descLines;
 
 // ================== ボタン (非ブロッキング長押し検出) ==================
-class LongPressButton {
-public:
-  explicit LongPressButton(int pin) : _pin(pin) {}
-
-  void begin() { pinMode(_pin, INPUT_PULLUP); }
-
-  // 状態を更新し、長押しが成立していれば true を返す
-  bool update() {
-    const bool pressed = digitalRead(_pin) == LOW;
-    const unsigned long now = millis();
-    if (pressed && !_pressed) _pressStart = now;
-    _justReleased = !pressed && _pressed;
-    _pressed = pressed;
-    return pressed && now - _pressStart >= LONG_PRESS_TIME;
-  }
-
-  bool isPressed() const { return _pressed; }
-  bool justReleased() const { return _justReleased; }
-  unsigned long heldMs() const { return _pressed ? millis() - _pressStart : 0; }
-
-private:
-  int _pin;
-  bool _pressed = false;
-  bool _justReleased = false;
-  unsigned long _pressStart = 0;
-};
-
-LongPressButton button(BUTTON_PIN);
+LongPressButton button(BUTTON_PIN, LONG_PRESS_TIME);
 bool apRequested = false;  // 起動処理中に長押しされた
 
 // 指定時間待つ。その間に長押しされたら apRequested を立てて true を返す
